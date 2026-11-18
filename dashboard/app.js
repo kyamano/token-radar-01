@@ -3,7 +3,7 @@
 // query string, so every view - the board, one protocol's detail, a filtered
 // board, the live anchors - is a link and a screenshot away.
 //
-// Views: ?segment=all|watchlist|early|live, ?category=<name>, ?chain=<name>,
+// Views: ?segment=all|watchlist|early|live|check, ?category=<name>, ?chain=<name>,
 // ?q=<text>, ?sort=implied|tvl|growth|age|signal|peer, ?detail=<slug>.
 
 (function () {
@@ -104,17 +104,19 @@
 
   function modelHtml() {
     var anchorRows = R.anchors.slice(0, 5).map(function (a) {
-      return '<tr><td>' + esc(a.category) + '</td><td>' + a.peers + '</td><td>' + a.median_ratio.toFixed(3) + '×</td><td>' + a.multiple.toFixed(3) + '×</td></tr>';
+      return '<tr><td>' + esc(a.category) + '</td><td>' + a.peers + '</td><td>' + a.median_ratio.toFixed(3) + '×</td><td>÷' + a.bias_factor.toFixed(2) + '</td><td>' + a.multiple.toFixed(3) + '×</td></tr>';
     }).join('');
     return (
-      '<div class="model"><div class="model-card"><h2>How the price is made — radar-2, peer-anchored</h2>' +
+      '<div class="model"><div class="model-card"><h2>How the price is made — radar-3, peer-anchored, bias-corrected</h2>' +
       '<div class="formula">implied = TVL × peer multiple × growth × maturity × breadth</div>' +
       '<p><strong>Peer multiple:</strong> the median market-cap / TVL of the live tokens in the same category, shrunk toward the global median (' +
-      R.global_multiple.toFixed(3) + '×); a category with fewer than four live peers is pinned near that median, so one outlier token cannot price a whole category. <strong>Growth:</strong> the 7-day TVL change, clamped to −50%…+100%, weighted 0.55. ' +
+      R.global_multiple.toFixed(3) + '×); a category with fewer than four live peers is pinned near that median, so one outlier token cannot price a whole category. ' +
+      '<strong>Bias correction:</strong> each category’s multiple is divided by the median error the raw multiple makes on that category’s own live tokens, priced leave-one-out — a category the market systematically pays less for than its peer median suggests is priced down before it reaches the board. The Model check view shows the full calibration. ' +
+      '<strong>Growth:</strong> the 7-day TVL change, clamped to −50%…+100%, weighted 0.55. ' +
       '<strong>Maturity:</strong> years tracked with no token, up to five. <strong>Breadth:</strong> +2.5% per extra chain, up to eight. ' +
       'No name is special-cased: the same function prices every row, so a protocol that launches next month is priced the day it appears in the data.</p></div>' +
       '<div class="model-card"><h2>Live peer anchors (market’s own prices)</h2>' +
-      '<table class="anchors"><tr><th>Category</th><th>Peers</th><th>Median</th><th>Used</th></tr>' + anchorRows + '</table>' +
+      '<table class="anchors"><tr><th>Category</th><th>Peers</th><th>Median</th><th>Bias ÷</th><th>Used</th></tr>' + anchorRows + '</table>' +
       '<p>Tokens that already trade are never ranked. They are the measuring stick, shown apart in the Live anchors view.</p></div></div>'
     );
   }
@@ -130,12 +132,12 @@
     }
     function sortOpt(v, label) { return '<option value="' + v + '"' + (state.sort === v ? ' selected' : '') + '>' + label + '</option>'; }
     return (
-      '<div class="controls"><span class="tabs">' + tab('all', 'All ranked') + tab('watchlist', 'Watchlist') + tab('early', 'Early finds') + tab('live', 'Live anchors') + '</span>' +
+      '<div class="controls"><span class="tabs">' + tab('all', 'All ranked') + tab('watchlist', 'Watchlist') + tab('early', 'Early finds') + tab('live', 'Live anchors') + tab('check', 'Model check') + '</span>' +
       '<label>Category <select id="f-cat">' + opts(categories, state.category, 'All categories') + '</select></label>' +
       '<label>Chain <select id="f-chain">' + opts(chains, state.chain, 'All chains') + '</select></label>' +
       '<label>Sort <select id="f-sort">' + sortOpt('implied', 'Implied value') + sortOpt('tvl', 'TVL') + sortOpt('growth', '7d growth') + sortOpt('signal', 'Signal') + sortOpt('age', 'Age') + sortOpt('peer', 'Peer multiple') + '</select></label>' +
       '<input type="search" id="f-q" placeholder="Search name or slug…" value="' + esc(state.q) + '"></div>' +
-      '<p class="count-line">Showing <strong>' + count + '</strong> ' + (state.segment === 'live' ? 'live anchor protocols whose tokens already trade' : 'protocols that record no token') +
+      '<p class="count-line">Showing <strong>' + count + '</strong> ' + (state.segment === 'live' ? 'live anchor protocols whose tokens already trade' : state.segment === 'check' ? 'live protocols the model was checked against, each priced with its own figures left out' : 'protocols that record no token') +
       (state.category || state.chain || state.q ? ' — filtered' : '') + '. Click any row for its model breakdown and farm plan.</p>'
     );
   }
@@ -185,6 +187,35 @@
     );
   }
 
+  function checkHtml() {
+    var v = R.validation;
+    var catRows = v.categories.map(function (c) {
+      return '<tr><td>' + esc(c.category) + '</td><td>' + c.n + '</td><td>' + c.median_ratio.toFixed(2) + '×</td><td>' + c.within_2x_pct + '%</td></tr>';
+    }).join('');
+    function caseList(list) {
+      return list.map(function (c) {
+        return (
+          '<li><span class="body"><strong>' + esc(c.name) + '</strong> <span class="pslug">' + esc(c.category || '') + '</span>' +
+          '<span class="chips"><span class="chip">Model <b>' + moneyFull(c.predicted_usd) + '</b></span>' +
+          '<span class="chip">Market <b>' + moneyFull(c.actual_usd) + '</b></span>' +
+          '<span class="chip">Ratio <b>' + c.ratio.toFixed(2) + '×</b></span></span></span></li>'
+        );
+      }).join('');
+    }
+    return (
+      '<section class="detail"><h2>The model, checked against the market</h2>' +
+      '<p>Every live-token protocol in the snapshot (' + v.n + ' of them) was priced by the same formula that prices the board, with its own market-cap / TVL left out of its peer anchor and its own pricing error left out of its category’s bias correction. ' +
+      'The median predicted / actual market cap is <strong>' + v.median_ratio.toFixed(2) + '×</strong>: at the median the model is calibrated — it does not systematically overprice or underprice what the market pays.</p>' +
+      '<p>Individual protocols still disperse widely around their category’s price — the typical miss is about ×' + Math.exp(v.median_abs_log_error).toFixed(1) +
+      ', because one token’s market cap depends on far more than its TVL. That dispersion is why the board prices by category rather than by any single comparable, and why every farm plan on this page sizes its position small enough to lose.</p>' +
+      '<div class="detail-grid"><div><h3>Calibration by category</h3>' +
+      '<table class="anchors"><tr><th>Category</th><th>Checked</th><th>Median ratio</th><th>Within 2×</th></tr>' + catRows + '</table>' +
+      '<p class="note">Categories with fewer than four checked protocols are left out of this table; their board prices lean on the global median instead.</p></div>' +
+      '<div><h3>Closest calls</h3><ol class="plan">' + caseList(v.closest) + '</ol>' +
+      '<h3>Widest misses, kept in view</h3><ol class="plan">' + caseList(v.furthest) + '</ol></div></div></section>'
+    );
+  }
+
   function splitStep(step) {
     var m = /^(.*) Cost: (.*)\. Time: (.*)\.$/.exec(step);
     if (!m) return { text: step, cost: '', time: '' };
@@ -221,11 +252,17 @@
       '<dt>TVL</dt><dd>' + moneyFull(r.tvl_usd) + '</dd>' +
       '<dt>7-day change</dt><dd>' + (r.change_7d == null ? 'unreported' : r.change_7d.toFixed(2) + '%') + '</dd>' +
       '<dt>Tracked since</dt><dd>' + esc(r.listed_at || 'unknown') + '</dd>' +
+      '<dt>Bias correction</dt><dd>÷' + r.bias_factor.toFixed(2) + ' — the median error of the raw peer multiple on this category’s live tokens</dd>' +
       '<dt>Signal score</dt><dd>' + r.signal_score + ' / 100</dd>' +
       '<dt>Token status</dt><dd>records no token</dd>' +
       '<dt>Board tier</dt><dd>' + (r.tier === 'watchlist' ? 'Watchlist (≥ $50M TVL)' : 'Early find (below the $50M floor)') + '</dd></dl>' +
       '<p class="note">“Records no token” is DefiLlama’s record, not proof: the board prices what a launch would be worth on today’s figures and never predicts that a launch will happen.</p></div>' +
-      '<div><h3>Farm plan — ' + r.farm_steps.length + ' steps, costed</h3><ol class="plan">' + plan + '</ol></div></div></section>'
+      '<div><h3>Farm plan — ' + r.farm_steps.length + ' steps, costed</h3>' +
+      '<p class="chips"><span class="chip">Capital <b>$' + r.plan.capital_usd + '</b></span>' +
+      '<span class="chip">Est. gas <b>$' + r.plan.est_gas_usd + '</b></span>' +
+      '<span class="chip">Hold <b>' + r.plan.hold_days + ' days · ' + r.plan.weeks + ' weekly actions</b></span></p>' +
+      '<p class="note">' + esc(r.plan.risk) + '</p>' +
+      '<ol class="plan">' + plan + '</ol></div></div></section>'
     );
   }
 
@@ -241,6 +278,8 @@
     var html = headerHtml() + statsHtml() + modelHtml();
     if (state.segment === 'live') {
       html += controlsHtml(R.live.length) + liveHtml();
+    } else if (state.segment === 'check') {
+      html += controlsHtml(R.validation.n) + checkHtml();
     } else {
       var rows = filteredRows();
       var detail = R.rows.filter(function (r) { return r.slug === state.detail; })[0];
