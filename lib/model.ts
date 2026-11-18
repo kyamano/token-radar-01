@@ -56,7 +56,7 @@ export interface Snapshot {
 }
 
 /** The model's version label, printed on the dashboard and in board.json. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** The knobs of the value model, stated on the dashboard so a reader can audit them. */
 export const MODEL = {
@@ -85,6 +85,8 @@ export interface PeerAnchor {
   peers: number;
   median_ratio: number;
   multiple: number;
+  /** The category bias divisor learned from live peers' pricing errors (1 = none). */
+  bias_factor: number;
 }
 
 /** A farm step: the action itself, what it costs, and how long it takes. */
@@ -92,6 +94,15 @@ export interface FarmStep {
   text: string;
   cost: string;
   time: string;
+}
+
+/** One plan's totals: the capital it ties up, its gas bill, its length, its main risk. */
+export interface PlanSummary {
+  capital_usd: number;
+  est_gas_usd: number;
+  hold_days: number;
+  weeks: number;
+  risk: string;
 }
 
 /** One row of board.json: the ranked board's row, with the full model breakdown. */
@@ -115,6 +126,7 @@ export interface BoardRow {
   model: {
     peer_multiple: number;
     peer_count: number;
+    bias_factor: number;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -140,10 +152,12 @@ export interface RadarRow {
   signal_score: number;
   peer_multiple: number;
   peer_count: number;
+  bias_factor: number;
   growth_multiplier: number;
   maturity_multiplier: number;
   breadth_multiplier: number;
   farm_steps: string[];
+  plan: PlanSummary;
 }
 
 /** A live-token protocol: an anchor, never a ranked row. */
@@ -156,6 +170,39 @@ export interface LiveRow {
   mcap_usd: number | null;
   change_7d: number | null;
   ratio: number | null;
+}
+
+/** One validation case: what the model predicted for a live token, and what the market says. */
+export interface ValidationCase {
+  name: string;
+  category: string | null;
+  predicted_usd: number;
+  actual_usd: number;
+  ratio: number;
+}
+
+/** One category's validation line: how the model did on that kind of protocol. */
+export interface ValidationCategory {
+  category: string;
+  n: number;
+  median_ratio: number;
+  within_2x_pct: number;
+}
+
+/**
+ * The model checked against the market: every live-token protocol in the snapshot
+ * priced by the same model with its own ratio left out of its peer anchor, then
+ * compared with the market cap the snapshot records for it.
+ */
+export interface ValidationData {
+  n: number;
+  median_ratio: number;
+  median_abs_log_error: number;
+  within_2x_pct: number;
+  within_3x_pct: number;
+  categories: ValidationCategory[];
+  closest: ValidationCase[];
+  furthest: ValidationCase[];
 }
 
 /** Everything the dashboard needs: the board, the live anchors, and the model itself. */
@@ -174,6 +221,7 @@ export interface RadarData {
   total_implied_usd: number;
   rows: RadarRow[];
   live: LiveRow[];
+  validation: ValidationData;
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -240,8 +288,9 @@ export function isLaunchCandidate(p: SnapshotProtocol): boolean {
  * the market's own price for a TVL dollar. Ratios outside [0.02, 5] are dropped as
  * broken records (a near-zero TVL against a legacy market cap, or the reverse).
  */
-export function peerAnchors(snapshot: Snapshot): { global: number; byCategory: Map<string, PeerAnchor> } {
-  const ratiosByCategory = new Map<string, number[]>();
+/** Every live peer's market-cap-to-TVL ratio, by category and overall, inside the model's sanity band. */
+function ratioIndex(snapshot: Snapshot): { byCategory: Map<string, number[]>; all: number[] } {
+  const byCategory = new Map<string, number[]>();
   const all: number[] = [];
   for (const p of snapshot.protocols) {
     if (isPreToken(p) || p.mcap_usd === null || p.tvl_usd <= 0) continue;
@@ -249,10 +298,15 @@ export function peerAnchors(snapshot: Snapshot): { global: number; byCategory: M
     if (ratio < MODEL.peer_ratio_low || ratio > MODEL.peer_ratio_high) continue;
     all.push(ratio);
     const key = p.category ?? 'Uncategorised';
-    const list = ratiosByCategory.get(key) ?? [];
+    const list = byCategory.get(key) ?? [];
     list.push(ratio);
-    ratiosByCategory.set(key, list);
+    byCategory.set(key, list);
   }
+  return { byCategory, all };
+}
+
+export function peerAnchors(snapshot: Snapshot): { global: number; byCategory: Map<string, PeerAnchor> } {
+  const { byCategory: ratiosByCategory, all } = ratioIndex(snapshot);
   const global = all.length > 0 ? median(all) : 0.2;
   const byCategory = new Map<string, PeerAnchor>();
   for (const [category, ratios] of ratiosByCategory) {
@@ -264,14 +318,14 @@ export function peerAnchors(snapshot: Snapshot): { global: number; byCategory: M
     if (ratios.length < MODEL.thin_peer_threshold) {
       multiple = clamp(multiple, global * MODEL.thin_band_low, global * MODEL.thin_band_high);
     }
-    byCategory.set(category, { category, peers: ratios.length, median_ratio: round4(med), multiple: round4(multiple) });
+    byCategory.set(category, { category, peers: ratios.length, median_ratio: round4(med), multiple: round4(multiple), bias_factor: 1 });
   }
   return { global: round4(global), byCategory };
 }
 
 /** The anchor a protocol is priced with: its category's, or the global median. */
 function anchorFor(p: SnapshotProtocol, anchors: Map<string, PeerAnchor>, global: number): PeerAnchor {
-  return anchors.get(p.category ?? 'Uncategorised') ?? { category: p.category ?? 'Uncategorised', peers: 0, median_ratio: global, multiple: global };
+  return anchors.get(p.category ?? 'Uncategorised') ?? { category: p.category ?? 'Uncategorised', peers: 0, median_ratio: global, multiple: global, bias_factor: 1 };
 }
 
 /** Every multiplier of the model for one protocol, and the implied value they make. */
@@ -288,6 +342,67 @@ export function impliedValue(
   const breadthMult = 1 + MODEL.breadth_step * Math.min(Math.max(p.chains.length - 1, 0), MODEL.breadth_max_extra_chains);
   const implied = Math.max(1, Math.round(p.tvl_usd * anchor.multiple * growthMult * maturityMult * breadthMult));
   return { implied, growthPct, growthMult, maturityMult, breadthMult, age };
+}
+
+/** One live protocol's raw peer multiple with its own ratio left out of the evidence. */
+function looRawMultiple(p: SnapshotProtocol, idx: { byCategory: Map<string, number[]>; all: number[] }): { multiple: number; peers: number } {
+  const own = p.mcap_usd !== null && p.tvl_usd > 0 ? p.mcap_usd / p.tvl_usd : Number.NaN;
+  const contributed = own >= MODEL.peer_ratio_low && own <= MODEL.peer_ratio_high;
+  const globalLoo = contributed ? medianWithout(idx.all, own) : median(idx.all);
+  const key = p.category ?? 'Uncategorised';
+  const catList = idx.byCategory.get(key) ?? [];
+  if (catList.length === 0) return { multiple: globalLoo, peers: 0 };
+  const looList = contributed ? catList.filter((_, i) => i !== catList.indexOf(own)) : catList;
+  const peers = looList.length;
+  const med = peers > 0 ? median(looList) : globalLoo;
+  return { multiple: shrunkMultiple(med, peers, globalLoo), peers };
+}
+
+/** How far to trust a category's measured bias: full weight only with many peers. */
+function biasAdjustment(peers: number, medianError: number): number {
+  const w = peers / (peers + 6);
+  return Math.exp(w * Math.log(clamp(medianError, 0.25, 4)));
+}
+
+/**
+ * The anchors the board is actually priced with: the raw peer multiples, each
+ * divided by the bias the raw model shows on that category's live tokens. The
+ * bias is the median leave-one-out pricing error on the category's own live
+ * protocols, so a category the raw multiple systematically overprices (or
+ * underprices) is pulled back toward what the market actually pays - learned
+ * from the snapshot itself, with no protocol named and no knob fitted by hand.
+ */
+export function pricingAnchors(snapshot: Snapshot): { global: number; byCategory: Map<string, PeerAnchor> } {
+  const raw = peerAnchors(snapshot);
+  const idx = ratioIndex(snapshot);
+  const errorsByCategory = new Map<string, number[]>();
+  const allErrors: number[] = [];
+  for (const p of snapshot.protocols) {
+    if (isPreToken(p) || p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
+    const own = p.mcap_usd / p.tvl_usd;
+    if (own < MODEL.peer_ratio_low || own > MODEL.peer_ratio_high) continue;
+    const { multiple } = looRawMultiple(p, idx);
+    const anchor: PeerAnchor = { category: p.category ?? 'Uncategorised', peers: 0, median_ratio: multiple, multiple, bias_factor: 1 };
+    const err = impliedValue(p, snapshot.as_of, anchor).implied / p.mcap_usd;
+    if (!Number.isFinite(err) || err <= 0) continue;
+    allErrors.push(err);
+    const key = p.category ?? 'Uncategorised';
+    const list = errorsByCategory.get(key) ?? [];
+    list.push(err);
+    errorsByCategory.set(key, list);
+  }
+  const globalBias = allErrors.length > 0 ? median(allErrors) : 1;
+  const byCategory = new Map<string, PeerAnchor>();
+  for (const [category, anchor] of raw.byCategory) {
+    const errs = errorsByCategory.get(category) ?? [];
+    const adj = errs.length > 0 ? biasAdjustment(errs.length, median(errs)) : biasAdjustment(8, globalBias);
+    byCategory.set(category, {
+      ...anchor,
+      multiple: round4(clamp(anchor.multiple / adj, MODEL.peer_clamp_low, MODEL.peer_clamp_high)),
+      bias_factor: round4(adj),
+    });
+  }
+  return { global: raw.global, byCategory };
 }
 
 /**
@@ -435,13 +550,31 @@ export function stepText(step: FarmStep): string {
   return s;
 }
 
+/** The main way one category's plan loses money, stated beside its totals. */
+function riskFor(p: SnapshotProtocol): string {
+  const c = (p.category ?? '').toLowerCase();
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral'))
+    return 'Main risk: liquidation if the collateral falls in value. Keep loan-to-value under 40% and check the health factor at the weekly check-in.';
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('options'))
+    return 'Main risk: funding costs and liquidation on the hedged legs. Keep free margin above three times the maintenance level for the whole hold.';
+  if (c.includes('bridge'))
+    return 'Main risk: bridge and wrapped-asset risk on the far side. Never hold more across the bridge than the plan needs, and bridge back at the first exit step.';
+  if (c.includes('liquid staking') || c.includes('restaking') || c.includes('staking'))
+    return 'Main risk: depeg and unbonding delays. The exit can take days after the request, so start the unwind before the hold ends, not after.';
+  if (c.includes('dex') || c.includes('swap'))
+    return 'Main risk: impermanent loss if the paired asset moves hard against the pool. The two-tranche exit limits slippage on the way out.';
+  if (c.includes('yield') || c.includes('vault') || c.includes('aggregator'))
+    return "Main risk: the vault's underlying strategies. A yield that jumps suddenly usually means new risk arrived, not free money; re-check before topping up.";
+  return 'Main risk: smart-contract risk, and the chance no token ever launches. The capital is sized so that losing all of it is survivable.';
+}
+
 /**
- * A protocol's farm plan: seven steps, each an action with a cost and a time. The
- * plan is built from the protocol's own record - category playbook, primary chain
- * fees, TVL-sized capital, age-sized hold - so two protocols rarely share a plan,
- * and no plan names a protocol the model has not read.
+ * A protocol's farm plan: seven steps, each an action with a cost and a time, plus
+ * the plan's totals. The plan is built from the protocol's own record - category
+ * playbook, primary chain fees, TVL-sized capital, age-sized hold - so two
+ * protocols rarely share a plan, and no plan names a protocol the model has not read.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+export function farmPlan(p: SnapshotProtocol, age: number | null): { steps: FarmStep[]; summary: PlanSummary } {
   const chain = chainOf(p);
   const gas = gasFor(chain);
   const capital = capitalFor(p);
@@ -450,7 +583,14 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const play = playFor(p, capital, chain);
   const variant = slugHash(p.slug) % 2;
   const gasBudget = Math.round(gas * 6 * 10) / 10;
-  return [
+  const summary: PlanSummary = {
+    capital_usd: capital,
+    est_gas_usd: Math.round(gas * (8 + weeks) * 10) / 10,
+    hold_days: hold,
+    weeks,
+    risk: riskFor(p),
+  };
+  const steps: FarmStep[] = [
     {
       text:
         variant === 0
@@ -482,11 +622,17 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '15 minutes',
     },
   ];
+  return { steps, summary };
+}
+
+/** Just the steps of a protocol's farm plan, as the board records them. */
+export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+  return farmPlan(p, age).steps;
 }
 
 /** The protocols the board ranks: the whole watchlist, plus every other launch candidate. */
 export function buildBoard(snapshot: Snapshot): BoardRow[] {
-  const { global, byCategory } = peerAnchors(snapshot);
+  const { global, byCategory } = pricingAnchors(snapshot);
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const watch = new Set(snapshot.watchlist);
   const chosen = new Map<string, SnapshotProtocol>();
@@ -523,6 +669,7 @@ export function buildBoard(snapshot: Snapshot): BoardRow[] {
     model: {
       peer_multiple: s.anchor.multiple,
       peer_count: s.anchor.peers,
+      bias_factor: s.anchor.bias_factor,
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
@@ -551,12 +698,120 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
+/** The median of a list with one occurrence of a value removed (leave-one-out). */
+function medianWithout(values: number[], value: number): number {
+  const at = values.indexOf(value);
+  if (at < 0) return median(values);
+  return median([...values.slice(0, at), ...values.slice(at + 1)]);
+}
+
+/** A multiple from a peer list and a global median, with the model's shrinkage and guards. */
+function shrunkMultiple(med: number, peers: number, global: number): number {
+  const w = peers / (peers + MODEL.peer_shrink_k);
+  let multiple = clamp(w * med + (1 - w) * global, MODEL.peer_clamp_low, MODEL.peer_clamp_high);
+  if (peers < MODEL.thin_peer_threshold) {
+    multiple = clamp(multiple, global * MODEL.thin_band_low, global * MODEL.thin_band_high);
+  }
+  return multiple;
+}
+
+/**
+ * The model turned on the protocols that already have tokens: each live protocol
+ * is priced by the same formula, with its own market-cap-to-TVL ratio left out of
+ * its category anchor and the global median, and the prediction is compared with
+ * the market cap the snapshot records. Nothing is fitted to the answers - the
+ * knobs are the board's own - so the spread below is the model's honest error.
+ */
+export function validation(snapshot: Snapshot): ValidationData {
+  const idx = ratioIndex(snapshot);
+  // First pass: the raw model's leave-one-out errors on every live protocol.
+  const raw: { p: SnapshotProtocol; multiple: number; err: number }[] = [];
+  const errorsByCategory = new Map<string, number[]>();
+  const allErrors: number[] = [];
+  for (const p of snapshot.protocols) {
+    if (isPreToken(p) || p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
+    const own = p.mcap_usd / p.tvl_usd;
+    if (own < MODEL.peer_ratio_low || own > MODEL.peer_ratio_high) continue;
+    const { multiple } = looRawMultiple(p, idx);
+    const anchor: PeerAnchor = { category: p.category ?? 'Uncategorised', peers: 0, median_ratio: multiple, multiple, bias_factor: 1 };
+    const err = impliedValue(p, snapshot.as_of, anchor).implied / p.mcap_usd;
+    if (!Number.isFinite(err) || err <= 0) continue;
+    raw.push({ p, multiple, err });
+    allErrors.push(err);
+    const key = p.category ?? 'Uncategorised';
+    const list = errorsByCategory.get(key) ?? [];
+    list.push(err);
+    errorsByCategory.set(key, list);
+  }
+  // Second pass: the board's own pricing - bias-corrected multiples, with the
+  // target's own error left out of the bias it is corrected by.
+  const cases: (ValidationCase & { slug: string; absLog: number })[] = [];
+  for (const { p, multiple, err } of raw) {
+    const key = p.category ?? 'Uncategorised';
+    const catErrs = errorsByCategory.get(key) ?? [];
+    const adj =
+      catErrs.length > 1
+        ? biasAdjustment(catErrs.length - 1, medianWithout(catErrs, err))
+        : biasAdjustment(Math.max(allErrors.length - 1, 0), medianWithout(allErrors, err));
+    const corrected = clamp(multiple / adj, MODEL.peer_clamp_low, MODEL.peer_clamp_high);
+    const anchor: PeerAnchor = { category: key, peers: 0, median_ratio: multiple, multiple: corrected, bias_factor: round4(adj) };
+    const v = impliedValue(p, snapshot.as_of, anchor);
+    const ratio = v.implied / p.mcap_usd!;
+    cases.push({
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      predicted_usd: v.implied,
+      actual_usd: p.mcap_usd!,
+      ratio: round4(ratio),
+      absLog: Math.abs(Math.log(ratio)),
+    });
+  }
+  const ratios = cases.map((c) => c.ratio);
+  const byCategory = new Map<string, (ValidationCase & { absLog: number })[]>();
+  for (const c of cases) {
+    const key = c.category ?? 'Uncategorised';
+    const list = byCategory.get(key) ?? [];
+    list.push(c);
+    byCategory.set(key, list);
+  }
+  const categories: ValidationCategory[] = [...byCategory.entries()]
+    .filter(([, list]) => list.length >= 4)
+    .map(([category, list]) => ({
+      category,
+      n: list.length,
+      median_ratio: round4(median(list.map((c) => c.ratio))),
+      within_2x_pct: Math.round((100 * list.filter((c) => c.ratio >= 0.5 && c.ratio <= 2).length) / list.length),
+    }))
+    .sort((a, b) => b.n - a.n || (a.category < b.category ? -1 : 1))
+    .slice(0, 14);
+  const byError = [...cases].sort((a, b) => a.absLog - b.absLog || (a.slug < b.slug ? -1 : 1));
+  const strip = (c: (typeof cases)[number]): ValidationCase => ({
+    name: c.name,
+    category: c.category,
+    predicted_usd: c.predicted_usd,
+    actual_usd: c.actual_usd,
+    ratio: c.ratio,
+  });
+  return {
+    n: cases.length,
+    median_ratio: round4(median(ratios)),
+    median_abs_log_error: round4(median(cases.map((c) => c.absLog))),
+    within_2x_pct: Math.round((100 * cases.filter((c) => c.ratio >= 0.5 && c.ratio <= 2).length) / cases.length),
+    within_3x_pct: Math.round((100 * cases.filter((c) => c.ratio >= 1 / 3 && c.ratio <= 3).length) / cases.length),
+    categories,
+    closest: byError.slice(0, 6).map(strip),
+    furthest: byError.slice(-6).reverse().map(strip),
+  };
+}
+
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
   const board = buildBoard(snapshot);
   const live = liveRows(snapshot);
-  const { global, byCategory } = peerAnchors(snapshot);
+  const { global, byCategory } = pricingAnchors(snapshot);
   const anchors = [...byCategory.values()].sort((a, b) => b.peers - a.peers || (a.category < b.category ? -1 : 1)).slice(0, 14);
+  const bySlug = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -570,6 +825,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     early_size: board.filter((r) => r.tier === 'early').length,
     live_size: live.length,
     total_implied_usd: board.reduce((sum, r) => sum + r.implied_value_usd, 0),
+    validation: validation(snapshot),
     rows: board.map((r) => ({
       rank: r.rank,
       slug: r.slug,
@@ -585,10 +841,12 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       signal_score: r.signal_score,
       peer_multiple: r.model.peer_multiple,
       peer_count: r.model.peer_count,
+      bias_factor: r.model.bias_factor,
       growth_multiplier: r.model.growth_multiplier,
       maturity_multiplier: r.model.maturity_multiplier,
       breadth_multiplier: r.model.breadth_multiplier,
       farm_steps: r.farm_steps,
+      plan: farmPlan(bySlug.get(r.slug)!, r.age_days).summary,
     })),
     live,
   };
